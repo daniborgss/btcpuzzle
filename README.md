@@ -128,5 +128,18 @@ CGO_ENABLED=1 go test ./...
 - Large ranges run until a match is found; there is no fixed iteration limit.
 - Only active ranges (status=1) are processed.
 - The 160 wallets and ranges in `data/` correspond to the puzzle entries.
-</content>
-</invoke>
+
+## License & attribution
+
+This project is an optimized, CPU-targeted derivative of
+[lmajowka/btcgoai](https://github.com/lmajowka/btcgoai).
+
+- The modifications contributed here (the affine search rewrite, the
+  `ripemd160simd` AVX2 package, and the build/optimization/documentation changes)
+  are licensed under the [MIT License](LICENSE) by Daniel Borges.
+- The upstream `lmajowka/btcgoai` repository has **no license**, so its original
+  code remains all-rights-reserved by its author. The MIT grant here covers only
+  the modifications, **not** the underlying original work. See [NOTICE](NOTICE).
+
+If you want to use or redistribute the project as a whole, please confirm the
+upstream terms with the original author first.

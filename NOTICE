@@ -1,0 +1,36 @@
+Attribution & licensing notes
+=============================
+
+This project (btcpuzzle-avx2) is an optimized, CPU-targeted derivative of:
+
+    btcgoai — https://github.com/lmajowka/btcgoai  (author: lmajowka)
+
+
+Modifications covered by ./LICENSE (MIT)
+----------------------------------------
+
+The following are contributed by Daniel Borges and are the "Modifications"
+licensed under the MIT License in ./LICENSE:
+
+  - the affine incremental EC point-addition search rewrite (search.go);
+  - the `ripemd160simd` package — 8-way AVX2 multi-message RIPEMD160;
+  - build, optimization, packaging and documentation changes targeting the
+    AVX2 / Intel Tiger Lake (Core i7-1185G7) platform.
+
+
+Status of the original work (IMPORTANT)
+---------------------------------------
+
+The upstream repository github.com/lmajowka/btcgoai does NOT include a license
+file. Under default copyright law this means its author retains all rights:
+no general permission to use, copy, modify, or redistribute that original
+portion has been granted.
+
+Therefore the MIT grant in ./LICENSE applies ONLY to the Modifications listed
+above, and NOT to the underlying original code, which remains "all rights
+reserved" by its author.
+
+If you wish to use or redistribute this repository as a whole, you should
+obtain permission from the original author (lmajowka), or confirm the upstream
+licensing terms, first. This NOTICE documents provenance and intent to credit
+the original author; it does not, and cannot, grant rights to their code.
