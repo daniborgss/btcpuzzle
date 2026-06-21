@@ -1,4 +1,6 @@
-# Compiled binaries / build artifacts
+# Compiled binaries / build artifacts (per-backend: btcpuzzle-avx2, -sse4, …)
+/btcpuzzle
+/btcpuzzle-*
 /bitcoin_finder
 *.exe
 *.test

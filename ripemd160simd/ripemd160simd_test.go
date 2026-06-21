@@ -8,6 +8,9 @@ import (
 	"golang.org/x/crypto/ripemd160"
 )
 
+// These tests run against whichever backend the build tags select: `go test`
+// exercises the pure-Go fallback, `go test -tags avx2` the AVX2 backend, etc.
+
 func refHash(msg []byte) [20]byte {
 	h := ripemd160.New()
 	h.Write(msg)
@@ -16,14 +19,14 @@ func refHash(msg []byte) [20]byte {
 	return out
 }
 
-// TestHash8MatchesStdlib checks every lane against the pure-Go reference over
-// many random batches, plus the edge cases of all-zero and all-0xff inputs.
-func TestHash8MatchesStdlib(t *testing.T) {
+// TestHashBatchMatchesStdlib checks every lane of the active backend against the
+// pure-Go reference over many random batches plus the all-zero / all-0xff edges.
+func TestHashBatchMatchesStdlib(t *testing.T) {
 	var in [Lanes][32]byte
 	var out [Lanes][20]byte
 
 	check := func(name string) {
-		Hash8(&out, &in)
+		HashBatch(&out, &in)
 		for l := 0; l < Lanes; l++ {
 			want := refHash(in[l][:])
 			if !bytes.Equal(out[l][:], want[:]) {
@@ -32,7 +35,6 @@ func TestHash8MatchesStdlib(t *testing.T) {
 		}
 	}
 
-	// Fixed edge cases.
 	check("all-zero")
 	for l := 0; l < Lanes; l++ {
 		for j := range in[l] {
@@ -41,7 +43,6 @@ func TestHash8MatchesStdlib(t *testing.T) {
 	}
 	check("all-ff")
 
-	// Random batches.
 	for iter := 0; iter < 200; iter++ {
 		for l := 0; l < Lanes; l++ {
 			if _, err := rand.Read(in[l][:]); err != nil {
@@ -52,9 +53,9 @@ func TestHash8MatchesStdlib(t *testing.T) {
 	}
 }
 
-// BenchmarkSIMD8 measures throughput of the 8-way AVX2 path (reported per
-// message via SetBytes-free accounting: ns/op is per batch of 8).
-func BenchmarkSIMD8(b *testing.B) {
+// BenchmarkBackend measures throughput of the active backend (ns/op is per batch
+// of Lanes messages).
+func BenchmarkBackend(b *testing.B) {
 	var in [Lanes][32]byte
 	var out [Lanes][20]byte
 	for l := 0; l < Lanes; l++ {
@@ -62,13 +63,13 @@ func BenchmarkSIMD8(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		Hash8(&out, &in)
+		HashBatch(&out, &in)
 	}
 }
 
-// BenchmarkStdlib8 is the apples-to-apples baseline: eight sequential pure-Go
-// RIPEMD160 hashes (what the current search loop does per 8 keys).
-func BenchmarkStdlib8(b *testing.B) {
+// BenchmarkStdlib is the apples-to-apples baseline: Lanes sequential pure-Go
+// RIPEMD160 hashes.
+func BenchmarkStdlib(b *testing.B) {
 	var in [Lanes][32]byte
 	for l := 0; l < Lanes; l++ {
 		rand.Read(in[l][:])

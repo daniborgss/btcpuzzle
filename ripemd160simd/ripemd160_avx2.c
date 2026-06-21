@@ -1,3 +1,9 @@
+// Compiled only for the AVX2 backend. cgo compiles every .c file in the package
+// regardless of Go build tags, so this guard keeps the file inert (and its AVX2
+// intrinsics out of the compiler's way) when another backend is selected. The
+// BACKEND_AVX2 macro is defined by avx2.go's cgo CFLAGS.
+#ifdef BACKEND_AVX2
+
 #include "ripemd160_avx2.h"
 #include <immintrin.h>
 #include <string.h>
@@ -152,3 +158,5 @@ void ripemd160_avx2_8(const uint8_t *in, uint8_t *out) {
         memcpy(p + 16, &o4[l], 4);
     }
 }
+
+#endif // BACKEND_AVX2

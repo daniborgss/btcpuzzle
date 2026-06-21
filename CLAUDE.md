@@ -4,31 +4,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
+The RIPEMD160 stage has **swappable backends selected by build tag** (see
+`ripemd160simd/`). Pick the backend for the target CPU and build on that machine:
+
 ```bash
-# Build (Linux x86_64 native; needs cgo + a C compiler for the AVX2 RIPEMD160 in
-# ripemd160simd. GOAMD64=v3 also enables AVX2/BMI2 for the Go field math, ~1.2x.)
-GOAMD64=v3 CGO_ENABLED=1 go build -o bitcoin_finder .
+# AVX2 (x86-64 w/ AVX2; cgo). GOAMD64=v3 also enables AVX2/BMI2 for the Go field
+# math (~1.2x). This is the build for the Tiger Lake dev machine.
+GOAMD64=v3 CGO_ENABLED=1 go build -tags avx2 -o btcpuzzle-avx2 .
+
+# SSE4 (older x86-64, no AVX2; cgo). 4-way backend — added in a later step.
+GOAMD64=v2 CGO_ENABLED=1 go build -tags sse4 -o btcpuzzle-sse4 .
+
+# Pure-Go fallback (no tag, no cgo) — builds/runs anywhere; slow, for correctness.
+CGO_ENABLED=0 go build -o btcpuzzle-purego .
 
 # Run
-./bitcoin_finder
+./btcpuzzle-avx2
 
-# Run tests (cgo required)
-CGO_ENABLED=1 go test ./...
-
-# Run a single test
-CGO_ENABLED=1 go test -run TestName ./...
-
-# Benchmark the hot loop (and profile it)
-CGO_ENABLED=1 go test -run=xxx -bench=BatchedIncremental -benchtime=3s -count=3 .
-CGO_ENABLED=1 go test -run=xxx -bench=BatchedIncremental -cpuprofile=/tmp/cpu.prof . && go tool pprof -top /tmp/cpu.prof
+# Tests / bench / profile — pass the SAME -tags to exercise that backend
+CGO_ENABLED=1 go test -tags avx2 ./...
+go test ./...                                   # tests the pure-Go fallback
+CGO_ENABLED=1 go test -tags avx2 -run TestName ./...
+CGO_ENABLED=1 go test -tags avx2 -run=xxx -bench=BatchedIncremental -benchtime=3s -count=3 .
+CGO_ENABLED=1 go test -tags avx2 -run=xxx -bench=BatchedIncremental -cpuprofile=/tmp/cpu.prof . && go tool pprof -top /tmp/cpu.prof
 
 # Tidy dependencies
 go mod tidy
 ```
 
-This package now requires **cgo** (the `ripemd160simd` subpackage compiles AVX2 C).
-`gcc`/`clang` must be on PATH and `CGO_ENABLED=1` (the default for a native Linux
-build). Building with `CGO_ENABLED=0` will fail.
+The `avx2`/`sse4` backends require **cgo** (`gcc`/`clang` on PATH, `CGO_ENABLED=1`)
+because `ripemd160simd` compiles SIMD C. The **no-tag** build is pure Go and needs
+no C compiler. Build commands must carry the right `-tags`; running tests/benches
+without the tag silently exercises the pure-Go fallback instead of the SIMD path.
 
 The program must be run from the project root directory, as it opens data files relative to the working directory (`data/wallets.json`, `data/ranges.json`, `data/hash160s.json`).
 
@@ -52,9 +59,14 @@ The tool searches private keys within a puzzle's defined range to find the key m
 4. `data.go` — data loading: reads `data/hash160s.json` as the primary source; falls back to `data/wallets.json` (address strings) but conversion is not implemented.
 5. `models.go` — JSON structs (`WalletData`, `RangeData`, `Range`, `Hash160Data`).
 6. `colors.go` — ANSI terminal color constants.
-7. `ripemd160simd/` — cgo subpackage: 8-way AVX2 multi-message RIPEMD160 for fixed
-   32-byte inputs (`Hash8`). The RIPEMD160 stage of the search runs through this;
-   `ripemd160simd_test.go` checks it byte-for-byte against `golang.org/x/crypto/ripemd160`.
+7. `ripemd160simd/` — multi-message RIPEMD160 for fixed 32-byte inputs, with
+   **build-tag-selected backends** all exposing the same API (`const Lanes` +
+   `HashBatch(out *[Lanes][20]byte, in *[Lanes][32]byte)`): `avx2.go`+`ripemd160_avx2.c`
+   (`-tags avx2`, 8-way AVX2 cgo), and `purego.go` (no tag, pure-Go fallback, no
+   cgo). An `sse4` backend is planned. `doc.go` documents the contract; the C files
+   are guarded by `#ifdef BACKEND_*` (cgo compiles every `.c` regardless of Go tags).
+   `ripemd160simd_test.go` is backend-agnostic — it checks whatever backend the tags
+   select byte-for-byte against `golang.org/x/crypto/ripemd160`.
 
 ### Data files (`data/`)
 

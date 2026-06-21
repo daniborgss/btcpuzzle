@@ -39,9 +39,9 @@ func generatorPoint() btcec.JacobianPoint {
 
 // hash160er computes RIPEMD160(SHA256(compressedPubKey)) for a batch of lanes.
 // SHA256 is done one lane at a time (it's hardware-accelerated via SHA-NI); its
-// outputs are buffered and the RIPEMD160 stage runs 8 lanes at once through the
-// AVX2 multi-message implementation in ripemd160simd. Buffers are reused so the
-// hot loop performs no per-key allocations.
+// outputs are buffered and the RIPEMD160 stage runs ripemd160simd.Lanes at once
+// through the multi-message backend selected by build tag (AVX2, SSE4, …).
+// Buffers are reused so the hot loop performs no per-key allocations.
 type hash160er struct {
 	sha    hash.Hash
 	pubkey [33]byte
@@ -122,8 +122,8 @@ func newLaneSet(baseKeys []*big.Int) *laneSet {
 
 // forEachHash hashes every (already affine) point in the batch and invokes fn
 // with each lane's hash160. It needs no field inversion. Live lanes are gathered
-// into groups of ripemd160simd.Lanes (8): each lane's SHA256 is computed, then
-// the whole group's RIPEMD160 is computed in one AVX2 multi-message call. It
+// into groups of ripemd160simd.Lanes: each lane's SHA256 is computed, then the
+// whole group's RIPEMD160 is computed in one multi-message backend call. It
 // stops early and returns true if fn returns true.
 func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool) bool {
 	const w = ripemd160simd.Lanes
@@ -144,12 +144,12 @@ func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool
 		if cnt == 0 {
 			continue
 		}
-		// Pad an incomplete final group with a copy so Hash8 is well-defined;
+		// Pad an incomplete final group with a copy so HashBatch is well-defined;
 		// padded lanes are never inspected.
 		for k := cnt; k < w; k++ {
 			h.shaIn[k] = h.shaIn[cnt-1]
 		}
-		ripemd160simd.Hash8(&h.h160, &h.shaIn)
+		ripemd160simd.HashBatch(&h.h160, &h.shaIn)
 		for k := 0; k < cnt; k++ {
 			if fn(idx[k], h.h160[k][:]) {
 				return true
