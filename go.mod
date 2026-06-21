@@ -1,4 +1,4 @@
-module github.com/daniborgss/btcpuzzle-avx2
+module github.com/daniborgss/btcpuzzle
 
 go 1.21
 

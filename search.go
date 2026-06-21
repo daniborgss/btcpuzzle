@@ -16,7 +16,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 
-	"github.com/daniborgss/btcpuzzle-avx2/ripemd160simd"
+	"github.com/daniborgss/btcpuzzle/ripemd160simd"
 )
 
 // lanesPerWorker is how many independent keys each worker advances in lockstep.
