@@ -37,6 +37,12 @@ func foldLane(z *Fe8, l int) {
 	}
 }
 
+// IsZero reports whether the element is congruent to 0 mod p. (Canonicalizes
+// via Bytes; only used on the rare degenerate-detection path in advance.)
+func (z *Fe) IsZero() bool {
+	return z.Bytes() == [32]byte{}
+}
+
 // AddBatch sets out[l] = a[l] + b[l] (mod p, denormalized) for all lanes.
 func AddBatch(out, a, b *Fe8) {
 	for l := 0; l < Lanes; l++ {

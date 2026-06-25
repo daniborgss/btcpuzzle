@@ -16,6 +16,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 
+	"github.com/daniborgss/btcpuzzle/field52simd"
 	"github.com/daniborgss/btcpuzzle/ripemd160simd"
 )
 
@@ -53,14 +54,15 @@ func newHash160er() *hash160er {
 	return &hash160er{sha: sha256.New()}
 }
 
-// sha256Pubkey writes SHA256(0x02/0x03 || x) into dst. x must be normalized.
-func (h *hash160er) sha256Pubkey(oddY bool, x *btcec.FieldVal, dst *[32]byte) {
+// sha256Pubkey writes SHA256(0x02/0x03 || x) into dst. xb is the canonical
+// 32-byte big-endian X coordinate; oddY selects the compressed-key prefix.
+func (h *hash160er) sha256Pubkey(oddY bool, xb *[32]byte, dst *[32]byte) {
 	if oddY {
 		h.pubkey[0] = 0x03
 	} else {
 		h.pubkey[0] = 0x02
 	}
-	x.PutBytesUnchecked(h.pubkey[1:])
+	copy(h.pubkey[1:], xb[:])
 
 	h.sha.Reset()
 	h.sha.Write(h.pubkey[:])
@@ -76,46 +78,79 @@ func (h *hash160er) sha256Pubkey(oddY bool, x *btcec.FieldVal, dst *[32]byte) {
 // Using affine addition (instead of Jacobian addition + a separate
 // Jacobian->affine conversion) cuts the field multiplications per key from
 // ~13 mul + 4 sq down to ~4 mul + 1 sq, which is the dominant cost of the loop.
+// Points are stored in the radix-2^52 SoA layout (field52simd.Fe8) the IFMA
+// kernel consumes: ng groups of 8 lanes. The affine X/Y and all advance()
+// scratch are groups; per-lane scalars (dead flags, the unpacked coords used
+// for hashing) are flat arrays of length ng*8.
 type laneSet struct {
-	x []btcec.FieldVal // affine X, normalized
-	y []btcec.FieldVal // affine Y, normalized
-	// dead[j] marks a lane that reached the point at infinity (P + G == O,
-	// i.e. P == -G). This is a ~2^-256 event in a real search and never
-	// happens in practice; the flag just keeps the math well-defined.
+	n  int // number of live lanes
+	ng int // number of 8-lane groups = ceil(n/8)
+
+	x []field52simd.Fe8 // affine X
+	y []field52simd.Fe8 // affine Y
+	// dead[j] marks a lane at the point at infinity (P == -G), plus the padding
+	// lanes (j >= n) in the final group. Real searches never reach -G (~2^-256);
+	// the flag keeps the batched math well-defined.
 	dead []bool
-	// Scratch reused across advance() calls to avoid per-step allocation.
-	num    []btcec.FieldVal // numerator of the slope lambda
-	denom  []btcec.FieldVal // denominator of the slope lambda
-	inv    []btcec.FieldVal // 1/denom, from the batched inversion
-	prefix []btcec.FieldVal // running prefix products for Montgomery's trick
-	xsub   []btcec.FieldVal // second x to subtract in x3 = lambda^2 - x - xsub
+
+	// Scratch reused across advance() to avoid per-step allocation.
+	num    []field52simd.Fe8 // numerator of the slope lambda
+	denom  []field52simd.Fe8 // denominator of the slope lambda
+	inv    []field52simd.Fe8 // 1/denom from the batched inversion
+	prefix []field52simd.Fe8 // running prefix products for Montgomery's trick
+	xsub   []field52simd.Fe8 // second x to subtract in x3 = lambda^2 - x - xsub
+
+	// Flat per-lane coordinates, refreshed from x/y at the top of forEachHash.
+	xsFlat []field52simd.Fe
+	ysFlat []field52simd.Fe
 }
 
 // newLaneSet seeds one affine point per base key with a full scalar
-// multiplication. This is the only place full scalar mults happen; every
-// advance() afterwards is a single affine addition per lane.
+// multiplication (the only place full scalar mults happen), converts each to
+// the radix-2^52 layout via the byte bridge, and packs them into 8-lane groups.
+// Padding lanes in the final group are marked dead.
 func newLaneSet(baseKeys []*big.Int) *laneSet {
+	const w = field52simd.Lanes
 	n := len(baseKeys)
+	ng := (n + w - 1) / w
 	ls := &laneSet{
-		x:      make([]btcec.FieldVal, n),
-		y:      make([]btcec.FieldVal, n),
-		dead:   make([]bool, n),
-		num:    make([]btcec.FieldVal, n),
-		denom:  make([]btcec.FieldVal, n),
-		inv:    make([]btcec.FieldVal, n),
-		prefix: make([]btcec.FieldVal, n),
-		xsub:   make([]btcec.FieldVal, n),
+		n:      n,
+		ng:     ng,
+		x:      make([]field52simd.Fe8, ng),
+		y:      make([]field52simd.Fe8, ng),
+		dead:   make([]bool, ng*w),
+		num:    make([]field52simd.Fe8, ng),
+		denom:  make([]field52simd.Fe8, ng),
+		inv:    make([]field52simd.Fe8, ng),
+		prefix: make([]field52simd.Fe8, ng),
+		xsub:   make([]field52simd.Fe8, ng),
+		xsFlat: make([]field52simd.Fe, ng*w),
+		ysFlat: make([]field52simd.Fe, ng*w),
 	}
 	var k btcec.ModNScalar
 	var p btcec.JacobianPoint
-	for j, key := range baseKeys {
-		k.SetByteSlice(padPrivateKey(key.Bytes(), 32))
-		btcec.ScalarBaseMultNonConst(&k, &p)
-		p.ToAffine()
-		ls.x[j].Set(&p.X)
-		ls.x[j].Normalize()
-		ls.y[j].Set(&p.Y)
-		ls.y[j].Normalize()
+	for g := 0; g < ng; g++ {
+		var xs, ys [w]field52simd.Fe
+		for pos := 0; pos < w; pos++ {
+			j := g*w + pos
+			if j < n {
+				k.SetByteSlice(padPrivateKey(baseKeys[j].Bytes(), 32))
+				btcec.ScalarBaseMultNonConst(&k, &p)
+				p.ToAffine()
+				p.X.Normalize()
+				p.Y.Normalize()
+				xb := *p.X.Bytes()
+				yb := *p.Y.Bytes()
+				xs[pos].SetBytes(&xb)
+				ys[pos].SetBytes(&yb)
+			} else {
+				ls.dead[j] = true
+				xs[pos] = xs[0]
+				ys[pos] = ys[0]
+			}
+		}
+		field52simd.PackLanes(&ls.x[g], &xs)
+		field52simd.PackLanes(&ls.y[g], &ys)
 	}
 	return ls
 }
@@ -127,16 +162,31 @@ func newLaneSet(baseKeys []*big.Int) *laneSet {
 // stops early and returns true if fn returns true.
 func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool) bool {
 	const w = ripemd160simd.Lanes
-	n := len(ls.x)
+
+	// Refresh the flat per-lane coordinates from the SoA groups (cheap; no
+	// modular reduction here).
+	for g := 0; g < ls.ng; g++ {
+		var xs, ys [field52simd.Lanes]field52simd.Fe
+		field52simd.UnpackLanes(&xs, &ls.x[g])
+		field52simd.UnpackLanes(&ys, &ls.y[g])
+		copy(ls.xsFlat[g*field52simd.Lanes:], xs[:])
+		copy(ls.ysFlat[g*field52simd.Lanes:], ys[:])
+	}
+
+	n := ls.n
 	var idx [w]int
 	j := 0
 	for j < n {
-		// Gather up to w live lanes and stage their SHA256 outputs.
+		// Gather up to w live lanes and stage their SHA256 outputs. The x and y
+		// coordinates are canonicalized here (Bytes) so the hash matches the
+		// reference; this is the slow per-lane reduction passo 2b will speed up.
 		cnt := 0
 		for j < n && cnt < w {
 			if !ls.dead[j] {
 				idx[cnt] = j
-				h.sha256Pubkey(ls.y[j].IsOdd(), &ls.x[j], &h.shaIn[cnt])
+				xb := ls.xsFlat[j].Bytes()
+				yb := ls.ysFlat[j].Bytes()
+				h.sha256Pubkey(yb[31]&1 == 1, &xb, &h.shaIn[cnt])
 				cnt++
 			}
 			j++
@@ -160,7 +210,8 @@ func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool
 }
 
 // advance adds G to every point in the batch using affine point addition,
-// sharing a single field inversion across the whole batch (Montgomery's trick).
+// sharing a single batched inversion across the whole batch (Montgomery's
+// trick), with all field arithmetic in the radix-2^52 8-way kernel.
 //
 // For a normal lane P=(x,y) with P != +/-G the new point is
 //
@@ -168,98 +219,181 @@ func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool
 //	x3     = lambda^2 - xG - x
 //	y3     = lambda*(x - x3) - y
 //
-// The denominator (x - xG) is the only field inverse needed, so all lanes'
-// denominators are inverted together. A lane where x == xG is the degenerate
-// case: if y == yG it is a point doubling (denominator 2y, numerator 3x^2);
-// otherwise P == -G and P+G is the point at infinity, which marks the lane dead.
+// The denominators (x - xG) are inverted together. A lane with x == xG is the
+// degenerate case (doubling if y == yG, else dead); these poison the shared
+// product, so they are detected — cheaply, via a zero lane in the accumulated
+// product — and fixed up on a scalar path before the inversion.
 func (ls *laneSet) advance(g *btcec.JacobianPoint) {
-	n := len(ls.x)
+	xGb := *g.X.Bytes()
+	yGb := *g.Y.Bytes()
+	var xGfe, yGfe field52simd.Fe
+	xGfe.SetBytes(&xGb)
+	yGfe.SetBytes(&yGb)
+	var xG8, yG8 field52simd.Fe8
+	broadcastFe8(&xG8, &xGfe)
+	broadcastFe8(&yG8, &yGfe)
 
-	var negXg, negYg btcec.FieldVal
-	negXg.NegateVal(&g.X, 1)
-	negYg.NegateVal(&g.Y, 1)
-
-	// First pass: build per-lane numerator/denominator and the x value to
-	// subtract in the x3 formula. denom is forced non-zero for every lane so
-	// the shared product (and its inverse) stays well-defined.
-	for j := 0; j < n; j++ {
+	// First pass (all lanes, in the kernel): denom = x - xG, num = y - yG,
+	// xsub = xG. Degenerate lanes are corrected afterwards.
+	for grp := 0; grp < ls.ng; grp++ {
+		field52simd.SubBatch(&ls.denom[grp], &ls.x[grp], &xG8)
+		field52simd.SubBatch(&ls.num[grp], &ls.y[grp], &yG8)
+		ls.xsub[grp] = xG8
+	}
+	// Force every dead/padding lane's denominator to 1 (cheap direct write) so
+	// it never zeroes the shared product.
+	for j := 0; j < ls.ng*field52simd.Lanes; j++ {
 		if ls.dead[j] {
-			ls.denom[j].SetInt(1)
-			continue
+			setLaneOne(&ls.denom[j/field52simd.Lanes], j%field52simd.Lanes)
 		}
-		var dx btcec.FieldVal
-		dx.Set(&ls.x[j])
-		dx.Add(&negXg)
-		dx.Normalize()
-		if dx.IsZero() {
-			var dy btcec.FieldVal
-			dy.Set(&ls.y[j])
-			dy.Add(&negYg)
-			dy.Normalize()
-			if dy.IsZero() {
-				// Point doubling: lambda = 3x^2 / 2y.
-				ls.num[j].SquareVal(&ls.x[j])
-				ls.num[j].MulInt(3)
-				ls.denom[j].Set(&ls.y[j])
-				ls.denom[j].MulInt(2)
-				ls.xsub[j].Set(&ls.x[j])
-			} else {
-				// P == -G: the sum is the point at infinity.
-				ls.dead[j] = true
-				ls.denom[j].SetInt(1)
+	}
+
+	// Forward product of all denominators (per lane position). A zero lane here
+	// means some non-dead lane had x == xG (denom 0) — the degenerate case.
+	acc := ls.forwardProduct()
+	if anyLaneZero(&acc) {
+		ls.fixupDegenerate(&yGfe)
+		acc = ls.forwardProduct()
+	}
+
+	// Invert the 8 accumulated products, then back-substitute to inv[grp].
+	var invAcc field52simd.Fe8
+	field52simd.InverseFe8(&invAcc, &acc)
+	for grp := ls.ng - 1; grp >= 0; grp-- {
+		field52simd.MulBatch(&ls.inv[grp], &invAcc, &ls.prefix[grp])
+		field52simd.MulBatch(&invAcc, &invAcc, &ls.denom[grp])
+	}
+
+	// Second pass (all lanes, in the kernel): lambda, x3, y3. Dead lanes compute
+	// harmless garbage and are skipped when hashing.
+	for grp := 0; grp < ls.ng; grp++ {
+		var lambda, sq, x3, t, y3 field52simd.Fe8
+		field52simd.MulBatch(&lambda, &ls.num[grp], &ls.inv[grp])
+		field52simd.SqrBatch(&sq, &lambda)
+		field52simd.SubBatch(&x3, &sq, &ls.x[grp])
+		field52simd.SubBatch(&x3, &x3, &ls.xsub[grp])
+		field52simd.SubBatch(&t, &ls.x[grp], &x3)
+		field52simd.MulBatch(&y3, &lambda, &t)
+		field52simd.SubBatch(&y3, &y3, &ls.y[grp])
+		ls.x[grp] = x3
+		ls.y[grp] = y3
+	}
+}
+
+// forwardProduct computes prefix[grp] (the running product of all earlier
+// denominators) and returns the total product, per lane position.
+func (ls *laneSet) forwardProduct() field52simd.Fe8 {
+	var acc field52simd.Fe8
+	setAllOne(&acc)
+	for grp := 0; grp < ls.ng; grp++ {
+		ls.prefix[grp] = acc
+		field52simd.MulBatch(&acc, &acc, &ls.denom[grp])
+	}
+	return acc
+}
+
+// fixupDegenerate handles the rare lanes whose denominator is 0 (x == xG): a
+// point doubling (y == yG → num = 3x^2, denom = 2y, xsub = x) or the point at
+// infinity (else → mark dead, denom = 1). Only groups containing such a lane
+// are unpacked. Uses btcec for the doubling slope on the scalar path.
+func (ls *laneSet) fixupDegenerate(yGfe *field52simd.Fe) {
+	const w = field52simd.Lanes
+	var negYg field52simd.Fe
+	negYg.Negate(yGfe)
+	var oneB [32]byte
+	oneB[31] = 1
+
+	for grp := 0; grp < ls.ng; grp++ {
+		var dens [w]field52simd.Fe
+		field52simd.UnpackLanes(&dens, &ls.denom[grp])
+		has := false
+		for pos := 0; pos < w; pos++ {
+			if !ls.dead[grp*w+pos] && dens[pos].IsZero() {
+				has = true
+				break
 			}
+		}
+		if !has {
 			continue
 		}
-		// Normal addition.
-		ls.num[j].Set(&ls.y[j])
-		ls.num[j].Add(&negYg)
-		ls.denom[j].Set(&dx)
-		ls.xsub[j].Set(&g.X)
-	}
-
-	// Batched inversion: inv[j] = 1/denom[j] using one Inverse() for all lanes.
-	var acc btcec.FieldVal
-	acc.SetInt(1)
-	for j := 0; j < n; j++ {
-		ls.prefix[j].Set(&acc)
-		acc.Mul(&ls.denom[j])
-	}
-	acc.Normalize()
-	acc.Inverse()
-	for j := n - 1; j >= 0; j-- {
-		ls.inv[j].Mul2(&acc, &ls.prefix[j])
-		acc.Mul(&ls.denom[j])
-	}
-
-	// Second pass: compute lambda and the new affine point per lane. All temps
-	// are declared once outside the loop so the hot path allocates nothing.
-	var lambda, x3, y3, t, neg btcec.FieldVal
-	for j := 0; j < n; j++ {
-		if ls.dead[j] {
-			continue
+		var xs, ys, nums, xsubs [w]field52simd.Fe
+		field52simd.UnpackLanes(&xs, &ls.x[grp])
+		field52simd.UnpackLanes(&ys, &ls.y[grp])
+		field52simd.UnpackLanes(&nums, &ls.num[grp])
+		field52simd.UnpackLanes(&xsubs, &ls.xsub[grp])
+		for pos := 0; pos < w; pos++ {
+			j := grp*w + pos
+			if ls.dead[j] || !dens[pos].IsZero() {
+				continue
+			}
+			var dy field52simd.Fe
+			dy.Add(&ys[pos], &negYg)
+			if dy.IsZero() {
+				// Doubling: num = 3x^2, denom = 2y, xsub = x (via btcec).
+				xb := xs[pos].Bytes()
+				yb := ys[pos].Bytes()
+				var xv, yv, numv, denv btcec.FieldVal
+				xv.SetBytes(&xb)
+				yv.SetBytes(&yb)
+				numv.SquareVal(&xv)
+				numv.MulInt(3)
+				numv.Normalize()
+				denv.Set(&yv)
+				denv.MulInt(2)
+				denv.Normalize()
+				nb := *numv.Bytes()
+				db := *denv.Bytes()
+				nums[pos].SetBytes(&nb)
+				dens[pos].SetBytes(&db)
+				xsubs[pos] = xs[pos]
+			} else {
+				ls.dead[j] = true
+				dens[pos].SetBytes(&oneB)
+			}
 		}
-		lambda.Mul2(&ls.num[j], &ls.inv[j])
-
-		// x3 = lambda^2 - x - xsub
-		x3.SquareVal(&lambda)
-		neg.NegateVal(&ls.x[j], 1)
-		x3.Add(&neg)
-		neg.NegateVal(&ls.xsub[j], 1)
-		x3.Add(&neg)
-		x3.Normalize()
-
-		// y3 = lambda*(x - x3) - y
-		neg.NegateVal(&x3, 1)
-		t.Set(&ls.x[j])
-		t.Add(&neg)
-		y3.Mul2(&lambda, &t)
-		neg.NegateVal(&ls.y[j], 1)
-		y3.Add(&neg)
-		y3.Normalize()
-
-		ls.x[j].Set(&x3)
-		ls.y[j].Set(&y3)
+		field52simd.PackLanes(&ls.denom[grp], &dens)
+		field52simd.PackLanes(&ls.num[grp], &nums)
+		field52simd.PackLanes(&ls.xsub[grp], &xsubs)
 	}
+}
+
+// broadcastFe8 sets every lane of out to fe.
+func broadcastFe8(out *field52simd.Fe8, fe *field52simd.Fe) {
+	var a [field52simd.Lanes]field52simd.Fe
+	for l := range a {
+		a[l] = *fe
+	}
+	field52simd.PackLanes(out, &a)
+}
+
+// setAllOne sets every lane of out to the field element 1.
+func setAllOne(out *field52simd.Fe8) {
+	for l := 0; l < field52simd.Lanes; l++ {
+		out[0][l] = 1
+		for k := 1; k < 5; k++ {
+			out[k][l] = 0
+		}
+	}
+}
+
+// setLaneOne sets a single lane of f to the field element 1.
+func setLaneOne(f *field52simd.Fe8, pos int) {
+	f[0][pos] = 1
+	for k := 1; k < 5; k++ {
+		f[k][pos] = 0
+	}
+}
+
+// anyLaneZero reports whether any of the 8 lanes of f is 0 mod p.
+func anyLaneZero(f *field52simd.Fe8) bool {
+	var fe [field52simd.Lanes]field52simd.Fe
+	field52simd.UnpackLanes(&fe, f)
+	for l := 0; l < field52simd.Lanes; l++ {
+		if fe[l].IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // searchForPrivateKey searches for a private key whose compressed public key

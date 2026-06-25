@@ -1,7 +1,11 @@
-// Compiled only for the AVX-512 IFMA backend. cgo compiles every .c file in the
-// package regardless of Go build tags, so this guard keeps the file inert (and
-// its IFMA intrinsics out of the compiler's way) when the backend is not
-// selected. BACKEND_AVX512IFMA is defined by batch_ifma.go's cgo CFLAGS.
+//go:build avx512ifma
+
+// Compiled only for the AVX-512 IFMA backend. Unlike ripemd160simd (whose
+// package always has an active cgo file under any cgo build), field52simd has
+// no cgo file unless the avx512ifma tag is set, so this .c would be an orphan
+// under e.g. -tags avx2 alone. The build constraint above excludes it in that
+// case; the #ifdef is a second guard (cgo otherwise compiles every .c).
+// BACKEND_AVX512IFMA is defined by batch_ifma.go's cgo CFLAGS.
 #ifdef BACKEND_AVX512IFMA
 
 #include "field52_ifma.h"
