@@ -96,16 +96,25 @@ static void carry_normalize(__m512i t[10]) {
     }
 }
 
-void field52_mul8(uint64_t *out, const uint64_t *a, const uint64_t *b) {
-    __m512i av[5], bv[5], t[10];
+static inline void load5(__m512i r[5], const uint64_t *p) {
     for (int k = 0; k < 5; k++) {
-        av[k] = _mm512_loadu_si512((const void *)(a + 8 * k));
-        bv[k] = _mm512_loadu_si512((const void *)(b + 8 * k));
+        r[k] = _mm512_loadu_si512((const void *)(p + 8 * k));
     }
+}
+
+static inline void store5(uint64_t *p, const __m512i r[5]) {
+    for (int k = 0; k < 5; k++) {
+        _mm512_storeu_si512((void *)(p + 8 * k), r[k]);
+    }
+}
+
+// mul_lanes/sqr_lanes/sub_lanes operate register-to-register so the fused EC
+// steps below chain them with no intermediate loads/stores (and no cgo call).
+static void mul_lanes(__m512i r[5], const __m512i av[5], const __m512i bv[5]) {
+    __m512i t[10];
     for (int k = 0; k < 10; k++) {
         t[k] = _mm512_setzero_si512();
     }
-    // Schoolbook 5x5: low52 -> column i+j, hi52 -> column i+j+1.
     for (int i = 0; i < 5; i++) {
         for (int j = 0; j < 5; j++) {
             t[i + j] = VLO(t[i + j], av[i], bv[j]);
@@ -113,30 +122,20 @@ void field52_mul8(uint64_t *out, const uint64_t *a, const uint64_t *b) {
         }
     }
     carry_normalize(t);
-
-    __m512i r[5];
     reduce(r, t);
-    for (int k = 0; k < 5; k++) {
-        _mm512_storeu_si512((void *)(out + 8 * k), r[k]);
-    }
 }
 
-void field52_sqr8(uint64_t *out, const uint64_t *a) {
-    __m512i av[5], t[10];
-    for (int k = 0; k < 5; k++) {
-        av[k] = _mm512_loadu_si512((const void *)(a + 8 * k));
-    }
+static void sqr_lanes(__m512i r[5], const __m512i av[5]) {
+    __m512i t[10];
     for (int k = 0; k < 10; k++) {
         t[k] = _mm512_setzero_si512();
     }
-    // Cross products a[i]*a[j], i<j, accumulated once.
     for (int i = 0; i < 5; i++) {
         for (int j = i + 1; j < 5; j++) {
             t[i + j] = VLO(t[i + j], av[i], av[j]);
             t[i + j + 1] = VHI(t[i + j + 1], av[i], av[j]);
         }
     }
-    // Double the cross contribution, then add the undoubled diagonals.
     for (int k = 0; k < 10; k++) {
         t[k] = _mm512_slli_epi64(t[k], 1);
     }
@@ -145,11 +144,181 @@ void field52_sqr8(uint64_t *out, const uint64_t *a) {
         t[2 * i + 1] = VHI(t[2 * i + 1], av[i], av[i]);
     }
     carry_normalize(t);
-
-    __m512i r[5];
     reduce(r, t);
+}
+
+// sub_lanes: r = a - b mod p (denormalized), via a + 4p - b then a top fold.
+static void sub_lanes(__m512i r[5], const __m512i av[5], const __m512i bv[5]) {
+    const __m512i mask52 = _mm512_set1_epi64((1ULL << 52) - 1);
+    const __m512i mask48 = _mm512_set1_epi64((1ULL << 48) - 1);
+    const __m512i c52 = _mm512_set1_epi64(4294968273ULL);
+    const __m512i nb[5] = {
+        _mm512_set1_epi64(4ULL * 0xFFFFEFFFFFC2FULL),
+        _mm512_set1_epi64(4ULL * 0xFFFFFFFFFFFFFULL),
+        _mm512_set1_epi64(4ULL * 0xFFFFFFFFFFFFFULL),
+        _mm512_set1_epi64(4ULL * 0xFFFFFFFFFFFFFULL),
+        _mm512_set1_epi64(4ULL * 0x0FFFFFFFFFFFFULL),
+    };
+    __m512i carry = _mm512_setzero_si512();
     for (int k = 0; k < 5; k++) {
-        _mm512_storeu_si512((void *)(out + 8 * k), r[k]);
+        __m512i v = _mm512_add_epi64(_mm512_add_epi64(av[k], nb[k]), carry);
+        v = _mm512_sub_epi64(v, bv[k]);
+        r[k] = _mm512_and_si512(v, mask52);
+        carry = _mm512_srli_epi64(v, 52);
+    }
+    // Fold the overflow above 2^256 (limb 4 >> 48) via c.
+    __m512i mtop = _mm512_srli_epi64(r[4], 48);
+    r[4] = _mm512_and_si512(r[4], mask48);
+    __m512i v = VLO(r[0], mtop, c52);
+    r[0] = _mm512_and_si512(v, mask52);
+    __m512i cc = _mm512_srli_epi64(v, 52);
+    for (int k = 1; k < 5; k++) {
+        v = _mm512_add_epi64(r[k], cc);
+        r[k] = _mm512_and_si512(v, mask52);
+        cc = _mm512_srli_epi64(v, 52);
+    }
+}
+
+void field52_mul8(uint64_t *out, const uint64_t *a, const uint64_t *b) {
+    __m512i av[5], bv[5], r[5];
+    load5(av, a);
+    load5(bv, b);
+    mul_lanes(r, av, bv);
+    store5(out, r);
+}
+
+void field52_sqr8(uint64_t *out, const uint64_t *a) {
+    __m512i av[5], r[5];
+    load5(av, a);
+    sqr_lanes(r, av);
+    store5(out, r);
+}
+
+// sqrn_lanes: r = a^(2^n), n >= 1 (r may alias a).
+static void sqrn_lanes(__m512i r[5], const __m512i a[5], int n) {
+    sqr_lanes(r, a);
+    for (int i = 1; i < n; i++) {
+        sqr_lanes(r, r);
+    }
+}
+
+// inv_lanes: r = a^(p-2) mod p (modular inverse) via the standard secp256k1
+// addition chain — the same chain as the Go InverseFe8, but the whole ~270-op
+// sequence runs in one cgo call instead of one per Mul/Sqr.
+static void inv_lanes(__m512i r[5], const __m512i a[5]) {
+    __m512i x2[5], x3[5], x6[5], x9[5], x11[5], x22[5], x44[5];
+    __m512i x88[5], x176[5], x220[5], x223[5], t[5];
+    sqr_lanes(x2, a);       mul_lanes(x2, x2, a);
+    sqr_lanes(x3, x2);      mul_lanes(x3, x3, a);
+    sqrn_lanes(x6, x3, 3);  mul_lanes(x6, x6, x3);
+    sqrn_lanes(x9, x6, 3);  mul_lanes(x9, x9, x3);
+    sqrn_lanes(x11, x9, 2); mul_lanes(x11, x11, x2);
+    sqrn_lanes(x22, x11, 11);  mul_lanes(x22, x22, x11);
+    sqrn_lanes(x44, x22, 22);  mul_lanes(x44, x44, x22);
+    sqrn_lanes(x88, x44, 44);  mul_lanes(x88, x88, x44);
+    sqrn_lanes(x176, x88, 88); mul_lanes(x176, x176, x88);
+    sqrn_lanes(x220, x176, 44); mul_lanes(x220, x220, x44);
+    sqrn_lanes(x223, x220, 3);  mul_lanes(x223, x223, x3);
+    sqrn_lanes(t, x223, 23); mul_lanes(t, t, x22);
+    sqrn_lanes(t, t, 5);     mul_lanes(t, t, a);
+    sqrn_lanes(t, t, 3);     mul_lanes(t, t, x2);
+    sqrn_lanes(t, t, 2);     mul_lanes(r, t, a);
+}
+
+void field52_inverse8(uint64_t *out, const uint64_t *a) {
+    __m512i av[5], r[5];
+    load5(av, a);
+    inv_lanes(r, av);
+    store5(out, r);
+}
+
+// ---- Fused per-pass steps over a whole laneSet (ng groups of 8) -------------
+//
+// Each takes one cgo call for all ng groups instead of one per group per op,
+// which is what actually matters at this point: cgo call overhead, not the SIMD
+// itself, dominated the loop. A group occupies 40 contiguous uint64 (5 limbs *
+// 8 lanes), so group g lives at offset 40*g. Mirrors advance() in search.go.
+
+#define FE8 40 // uint64 per Fe8 group
+
+// slope_setup: denom = x - xG, num = y - yG, for every group.
+void field52_slope_setup8(uint64_t *denom, uint64_t *num, const uint64_t *x,
+                          const uint64_t *y, const uint64_t *xG,
+                          const uint64_t *yG, long ng) {
+    __m512i XG[5], YG[5];
+    load5(XG, xG);
+    load5(YG, yG);
+    for (long g = 0; g < ng; g++) {
+        __m512i X[5], Y[5], r[5];
+        load5(X, x + FE8 * g);
+        load5(Y, y + FE8 * g);
+        sub_lanes(r, X, XG);
+        store5(denom + FE8 * g, r);
+        sub_lanes(r, Y, YG);
+        store5(num + FE8 * g, r);
+    }
+}
+
+// mont_forward: prefix[g] = product of denom[0..g-1]; accOut = full product.
+void field52_mont_forward8(uint64_t *prefix, uint64_t *accOut,
+                           const uint64_t *denom, long ng) {
+    __m512i acc[5];
+    acc[0] = _mm512_set1_epi64(1);
+    for (int k = 1; k < 5; k++) {
+        acc[k] = _mm512_setzero_si512();
+    }
+    for (long g = 0; g < ng; g++) {
+        store5(prefix + FE8 * g, acc);
+        __m512i D[5], r[5];
+        load5(D, denom + FE8 * g);
+        mul_lanes(r, acc, D);
+        for (int k = 0; k < 5; k++) {
+            acc[k] = r[k];
+        }
+    }
+    store5(accOut, acc);
+}
+
+// mont_backward: inv[g] = invAcc * prefix[g]; invAcc *= denom[g] (reverse scan).
+void field52_mont_backward8(uint64_t *inv, uint64_t *invAcc,
+                            const uint64_t *prefix, const uint64_t *denom,
+                            long ng) {
+    __m512i IA[5];
+    load5(IA, invAcc);
+    for (long g = ng - 1; g >= 0; g--) {
+        __m512i P[5], D[5], r[5];
+        load5(P, prefix + FE8 * g);
+        mul_lanes(r, IA, P);
+        store5(inv + FE8 * g, r);
+        load5(D, denom + FE8 * g);
+        mul_lanes(r, IA, D);
+        for (int k = 0; k < 5; k++) {
+            IA[k] = r[k];
+        }
+    }
+    store5(invAcc, IA);
+}
+
+// point_add: the second-pass affine add for every group, in registers:
+//   lambda = num*inv; x3 = lambda^2 - x - xsub; y3 = lambda*(x - x3) - y.
+void field52_point_add8(uint64_t *x, uint64_t *y, const uint64_t *num,
+                        const uint64_t *inv, const uint64_t *xsub, long ng) {
+    for (long g = 0; g < ng; g++) {
+        __m512i X[5], Y[5], N[5], I[5], XS[5], L[5], S[5], X3[5], T[5], Y3[5];
+        load5(X, x + FE8 * g);
+        load5(Y, y + FE8 * g);
+        load5(N, num + FE8 * g);
+        load5(I, inv + FE8 * g);
+        load5(XS, xsub + FE8 * g);
+        mul_lanes(L, N, I);   // lambda
+        sqr_lanes(S, L);      // lambda^2
+        sub_lanes(X3, S, X);  // - x
+        sub_lanes(X3, X3, XS); // - xsub
+        sub_lanes(T, X, X3);  // x - x3
+        mul_lanes(Y3, L, T);  // lambda*(x - x3)
+        sub_lanes(Y3, Y3, Y); // - y
+        store5(x + FE8 * g, X3);
+        store5(y + FE8 * g, Y3);
     }
 }
 

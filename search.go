@@ -233,12 +233,10 @@ func (ls *laneSet) advance(g *btcec.JacobianPoint) {
 	broadcastFe8(&xG8, &xGfe)
 	broadcastFe8(&yG8, &yGfe)
 
-	// First pass (all lanes, in the kernel): denom = x - xG, num = y - yG,
-	// xsub = xG. Degenerate lanes are corrected afterwards.
+	// First pass: denom = x - xG, num = y - yG (one fused call over all groups).
+	field52simd.SlopeSetup(ls.denom, ls.num, ls.x, ls.y, &xG8, &yG8)
 	for grp := 0; grp < ls.ng; grp++ {
-		field52simd.SubBatch(&ls.denom[grp], &ls.x[grp], &xG8)
-		field52simd.SubBatch(&ls.num[grp], &ls.y[grp], &yG8)
-		ls.xsub[grp] = xG8
+		ls.xsub[grp] = xG8 // xsub = xG for normal lanes (doubling overrides it)
 	}
 	// Force every dead/padding lane's denominator to 1 (cheap direct write) so
 	// it never zeroes the shared product.
@@ -248,48 +246,21 @@ func (ls *laneSet) advance(g *btcec.JacobianPoint) {
 		}
 	}
 
-	// Forward product of all denominators (per lane position). A zero lane here
-	// means some non-dead lane had x == xG (denom 0) — the degenerate case.
-	acc := ls.forwardProduct()
+	// Batched inversion: forward product, invert the 8 lanes, backward scan.
+	// A zero lane in the forward product means some non-dead lane had x == xG
+	// (denom 0) — the degenerate case; fix it up and redo the forward scan.
+	var acc, invAcc field52simd.Fe8
+	field52simd.MontForward(ls.prefix, &acc, ls.denom)
 	if anyLaneZero(&acc) {
 		ls.fixupDegenerate(&yGfe)
-		acc = ls.forwardProduct()
+		field52simd.MontForward(ls.prefix, &acc, ls.denom)
 	}
-
-	// Invert the 8 accumulated products, then back-substitute to inv[grp].
-	var invAcc field52simd.Fe8
 	field52simd.InverseFe8(&invAcc, &acc)
-	for grp := ls.ng - 1; grp >= 0; grp-- {
-		field52simd.MulBatch(&ls.inv[grp], &invAcc, &ls.prefix[grp])
-		field52simd.MulBatch(&invAcc, &invAcc, &ls.denom[grp])
-	}
+	field52simd.MontBackward(ls.inv, &invAcc, ls.prefix, ls.denom)
 
-	// Second pass (all lanes, in the kernel): lambda, x3, y3. Dead lanes compute
-	// harmless garbage and are skipped when hashing.
-	for grp := 0; grp < ls.ng; grp++ {
-		var lambda, sq, x3, t, y3 field52simd.Fe8
-		field52simd.MulBatch(&lambda, &ls.num[grp], &ls.inv[grp])
-		field52simd.SqrBatch(&sq, &lambda)
-		field52simd.SubBatch(&x3, &sq, &ls.x[grp])
-		field52simd.SubBatch(&x3, &x3, &ls.xsub[grp])
-		field52simd.SubBatch(&t, &ls.x[grp], &x3)
-		field52simd.MulBatch(&y3, &lambda, &t)
-		field52simd.SubBatch(&y3, &y3, &ls.y[grp])
-		ls.x[grp] = x3
-		ls.y[grp] = y3
-	}
-}
-
-// forwardProduct computes prefix[grp] (the running product of all earlier
-// denominators) and returns the total product, per lane position.
-func (ls *laneSet) forwardProduct() field52simd.Fe8 {
-	var acc field52simd.Fe8
-	setAllOne(&acc)
-	for grp := 0; grp < ls.ng; grp++ {
-		ls.prefix[grp] = acc
-		field52simd.MulBatch(&acc, &acc, &ls.denom[grp])
-	}
-	return acc
+	// Second pass: lambda, x3, y3 (one fused call over all groups). Dead lanes
+	// compute harmless garbage and are skipped when hashing.
+	field52simd.PointAdd(ls.x, ls.y, ls.num, ls.inv, ls.xsub)
 }
 
 // fixupDegenerate handles the rare lanes whose denominator is 0 (x == xG): a
@@ -364,16 +335,6 @@ func broadcastFe8(out *field52simd.Fe8, fe *field52simd.Fe) {
 		a[l] = *fe
 	}
 	field52simd.PackLanes(out, &a)
-}
-
-// setAllOne sets every lane of out to the field element 1.
-func setAllOne(out *field52simd.Fe8) {
-	for l := 0; l < field52simd.Lanes; l++ {
-		out[0][l] = 1
-		for k := 1; k < 5; k++ {
-			out[k][l] = 0
-		}
-	}
 }
 
 // setLaneOne sets a single lane of f to the field element 1.

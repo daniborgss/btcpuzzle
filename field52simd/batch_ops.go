@@ -70,60 +70,6 @@ func SubBatch(out, a, b *Fe8) {
 	}
 }
 
-// sqrN sets out = in^(2^n) for n >= 1 (out may alias in).
-func sqrN(out, in *Fe8, n int) {
-	SqrBatch(out, in)
-	for i := 1; i < n; i++ {
-		SqrBatch(out, out)
-	}
-}
-
-// InverseFe8 sets out[l] = a[l]^(-1) mod p for all lanes, via Fermat
-// (a^(p-2)) using the standard secp256k1 addition chain. All 8 lanes are
-// inverted in parallel through MulBatch/SqrBatch. a[l] == 0 maps to 0.
-func InverseFe8(out, a *Fe8) {
-	var x2, x3, x6, x9, x11, x22, x44, x88, x176, x220, x223, t Fe8
-
-	SqrBatch(&x2, a)
-	MulBatch(&x2, &x2, a) // a^(2^2-1)
-
-	SqrBatch(&x3, &x2)
-	MulBatch(&x3, &x3, a) // a^(2^3-1)
-
-	sqrN(&x6, &x3, 3)
-	MulBatch(&x6, &x6, &x3) // a^(2^6-1)
-
-	sqrN(&x9, &x6, 3)
-	MulBatch(&x9, &x9, &x3) // a^(2^9-1)
-
-	sqrN(&x11, &x9, 2)
-	MulBatch(&x11, &x11, &x2) // a^(2^11-1)
-
-	sqrN(&x22, &x11, 11)
-	MulBatch(&x22, &x22, &x11) // a^(2^22-1)
-
-	sqrN(&x44, &x22, 22)
-	MulBatch(&x44, &x44, &x22) // a^(2^44-1)
-
-	sqrN(&x88, &x44, 44)
-	MulBatch(&x88, &x88, &x44) // a^(2^88-1)
-
-	sqrN(&x176, &x88, 88)
-	MulBatch(&x176, &x176, &x88) // a^(2^176-1)
-
-	sqrN(&x220, &x176, 44)
-	MulBatch(&x220, &x220, &x44) // a^(2^220-1)
-
-	sqrN(&x223, &x220, 3)
-	MulBatch(&x223, &x223, &x3) // a^(2^223-1)
-
-	// Final window: a^(p-2) = a^(2^256 - 2^32 - 979).
-	sqrN(&t, &x223, 23)
-	MulBatch(&t, &t, &x22)
-	sqrN(&t, &t, 5)
-	MulBatch(&t, &t, a)
-	sqrN(&t, &t, 3)
-	MulBatch(&t, &t, &x2)
-	sqrN(&t, &t, 2)
-	MulBatch(out, &t, a)
-}
+// InverseFe8 is backend-selected: the IFMA build runs the whole Fermat chain in
+// one cgo call (batch_ifma.go); the pure-Go build (batch_purego.go) chains
+// MulBatch/SqrBatch.
