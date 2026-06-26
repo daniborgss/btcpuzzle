@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"hash"
 	"math/big"
 	"os"
 	"runtime"
@@ -44,18 +43,19 @@ func generatorPoint() btcec.JacobianPoint {
 // through the multi-message backend selected by build tag (AVX2, SSE4, …).
 // Buffers are reused so the hot loop performs no per-key allocations.
 type hash160er struct {
-	sha    hash.Hash
 	pubkey [33]byte
 	shaIn  [ripemd160simd.Lanes][32]byte // SHA256 outputs feeding the RIPEMD160 stage
 	h160   [ripemd160simd.Lanes][20]byte // RIPEMD160 outputs
 }
 
 func newHash160er() *hash160er {
-	return &hash160er{sha: sha256.New()}
+	return &hash160er{}
 }
 
 // sha256Pubkey writes SHA256(0x02/0x03 || x) into dst. xb is the canonical
 // 32-byte big-endian X coordinate; oddY selects the compressed-key prefix.
+// Sum256 (one-shot) is used rather than a persistent Digest: it avoids the
+// per-call state clone that Digest.Sum does, ~7% on the whole loop.
 func (h *hash160er) sha256Pubkey(oddY bool, xb []byte, dst *[32]byte) {
 	if oddY {
 		h.pubkey[0] = 0x03
@@ -64,9 +64,8 @@ func (h *hash160er) sha256Pubkey(oddY bool, xb []byte, dst *[32]byte) {
 	}
 	copy(h.pubkey[1:], xb)
 
-	h.sha.Reset()
-	h.sha.Write(h.pubkey[:])
-	h.sha.Sum(dst[:0])
+	sum := sha256.Sum256(h.pubkey[:])
+	copy(dst[:], sum[:])
 }
 
 // laneSet holds a batch of curve points kept in affine coordinates and advanced
