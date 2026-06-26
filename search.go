@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"math/big"
@@ -12,11 +11,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 
 	"github.com/daniborgss/btcpuzzle/field52simd"
 	"github.com/daniborgss/btcpuzzle/ripemd160simd"
+	"github.com/daniborgss/btcpuzzle/sha256simd"
 )
 
 // lanesPerWorker is how many independent keys each worker advances in lockstep.
@@ -38,34 +39,18 @@ func generatorPoint() btcec.JacobianPoint {
 }
 
 // hash160er computes RIPEMD160(SHA256(compressedPubKey)) for a batch of lanes.
-// SHA256 is done one lane at a time (it's hardware-accelerated via SHA-NI); its
-// outputs are buffered and the RIPEMD160 stage runs ripemd160simd.Lanes at once
-// through the multi-message backend selected by build tag (AVX2, SSE4, …).
-// Buffers are reused so the hot loop performs no per-key allocations.
+// Both stages run through multi-message backends selected by build tag: the 8
+// compressed pubkeys are SHA256'd in one call (SHA-NI or stdlib), then their
+// digests feed the RIPEMD160 stage in groups of ripemd160simd.Lanes. Buffers are
+// reused so the hot loop performs no per-key allocations.
 type hash160er struct {
-	pubkey [33]byte
-	shaIn  [ripemd160simd.Lanes][32]byte // SHA256 outputs feeding the RIPEMD160 stage
-	h160   [ripemd160simd.Lanes][20]byte // RIPEMD160 outputs
+	msgs  [sha256simd.Lanes][33]byte // compressed pubkeys (0x02/03 || X)
+	shaIn [sha256simd.Lanes][32]byte // SHA256 outputs feeding RIPEMD160
+	h160  [ripemd160simd.Lanes][20]byte
 }
 
 func newHash160er() *hash160er {
 	return &hash160er{}
-}
-
-// sha256Pubkey writes SHA256(0x02/0x03 || x) into dst. xb is the canonical
-// 32-byte big-endian X coordinate; oddY selects the compressed-key prefix.
-// Sum256 (one-shot) is used rather than a persistent Digest: it avoids the
-// per-call state clone that Digest.Sum does, ~7% on the whole loop.
-func (h *hash160er) sha256Pubkey(oddY bool, xb []byte, dst *[32]byte) {
-	if oddY {
-		h.pubkey[0] = 0x03
-	} else {
-		h.pubkey[0] = 0x02
-	}
-	copy(h.pubkey[1:], xb)
-
-	sum := sha256.Sum256(h.pubkey[:])
-	copy(dst[:], sum[:])
 }
 
 // laneSet holds a batch of curve points kept in affine coordinates and advanced
@@ -161,24 +146,28 @@ func newLaneSet(baseKeys []*big.Int) *laneSet {
 // whole group's RIPEMD160 is computed in one multi-message backend call. It
 // stops early and returns true if fn returns true.
 func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool) bool {
-	const w = ripemd160simd.Lanes
+	const sw = sha256simd.Lanes
+	const rw = ripemd160simd.Lanes // divides sw (both 8, or rw=4)
 
 	// Canonicalize all lanes' X/Y to 32-byte big-endian in two fused calls.
 	field52simd.CanonBytes(ls.xb, ls.x)
 	field52simd.CanonBytes(ls.yb, ls.y)
 
 	n := ls.n
-	var idx [w]int
+	var idx [sw]int
 	j := 0
 	for j < n {
-		// Gather up to w live lanes and stage their SHA256 outputs.
+		// Gather up to sw live lanes and build their compressed pubkeys.
 		cnt := 0
-		for j < n && cnt < w {
+		for j < n && cnt < sw {
 			if !ls.dead[j] {
 				idx[cnt] = j
-				xb := ls.xb[j*32 : j*32+32]
-				oddY := ls.yb[j*32+31]&1 == 1
-				h.sha256Pubkey(oddY, xb, &h.shaIn[cnt])
+				if ls.yb[j*32+31]&1 == 1 {
+					h.msgs[cnt][0] = 0x03
+				} else {
+					h.msgs[cnt][0] = 0x02
+				}
+				copy(h.msgs[cnt][1:], ls.xb[j*32:j*32+32])
 				cnt++
 			}
 			j++
@@ -186,15 +175,19 @@ func (ls *laneSet) forEachHash(h *hash160er, fn func(lane int, h160 []byte) bool
 		if cnt == 0 {
 			continue
 		}
-		// Pad an incomplete final group with a copy so HashBatch is well-defined;
-		// padded lanes are never inspected.
-		for k := cnt; k < w; k++ {
-			h.shaIn[k] = h.shaIn[cnt-1]
+		// Pad the incomplete group; padded lanes are never inspected.
+		for k := cnt; k < sw; k++ {
+			h.msgs[k] = h.msgs[cnt-1]
 		}
-		ripemd160simd.HashBatch(&h.h160, &h.shaIn)
-		for k := 0; k < cnt; k++ {
-			if fn(idx[k], h.h160[k][:]) {
-				return true
+		sha256simd.HashBatch(&h.shaIn, &h.msgs)
+		// RIPEMD160 over the SHA digests, rw at a time.
+		for base := 0; base < cnt; base += rw {
+			rin := (*[rw][32]byte)(unsafe.Pointer(&h.shaIn[base]))
+			ripemd160simd.HashBatch(&h.h160, rin)
+			for k := 0; k < rw && base+k < cnt; k++ {
+				if fn(idx[base+k], h.h160[k][:]) {
+					return true
+				}
 			}
 		}
 	}
